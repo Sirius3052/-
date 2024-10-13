@@ -1,0 +1,113 @@
+# Импортируем необходимые библиотеки
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, Dataset
+from transformers import BertTokenizer, BertForSequenceClassification, AdamW
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, classification_report
+
+# Загружаем данные
+data = pd.read_csv('books.csv')  # Файл с данными о книгах
+
+# Предобработка данных: удаляем лишние символы и токенизируем текст
+data['Description'] = data['Description'].str.lower().str.replace('[^\w\s]', ' ')
+
+# Преобразование жанров в числовые метки
+label_encoder = LabelEncoder()
+data['Genre'] = label_encoder.fit_transform(data['Genre'])
+
+# Загрузка токенайзера и модели BERT
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=len(label_encoder.classes_))
+
+# Создание кастомного Dataset для загрузки данных
+class BooksDataset(Dataset):
+    def init(self, texts, labels, tokenizer, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def len(self):
+        return len(self.texts)
+
+    def getitem(self, idx):
+        text = self.texts[idx]
+        label = self.labels[idx]
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+# Разделение данных на обучающую и тестовую выборки
+X_train, X_test, y_train, y_test = train_test_split(data['Description'], data['Genre'], test_size=0.2, random_state=42)
+
+# Параметры модели и данные
+BATCH_SIZE = 16
+MAX_LENS = 128
+train_dataset = BooksDataset(X_train.tolist(), y_train.tolist(), tokenizer, MAX_LEN)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# Оптимизатор и функция потерь
+optimizer = AdamW(model.parameters(), lr=2e-5)
+
+# Обучение модели
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+model.train()
+
+for epoch in range(3):  # Количество эпох
+    for batch in train_loader:
+        optimizer.zero_grad()
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+    print(f'Epoch {epoch + 1} completed')
+
+# Оценка модели
+test_dataset = BooksDataset(X_test.tolist(), y_test.tolist(), tokenizer, MAX_LENS)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+
+model.eval()
+predictions, true_labels = [], []
+
+with torch.no_grad():
+    for batch in test_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        outputs = model(input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
+        predictions.extend(preds)
+        true_labels.extend(labels.cpu().numpy())
+
+print(f'Accuracy: {accuracy_score(true_labels, predictions):.2f}')
+print(classification_report(true_labels, predictions, target_names=label_encoder.classes_))
+
+# Функция поиска книг по жанру
+def recommend_books(preferred_genre):
+    genre_label = label_encoder.transform([preferred_genre])[0]
+    matching_books = data[data['Genre'] == genre_label][['Title', 'Author']]
+    return matching_books
+
+# Пример использования
+preferred_genre = 'Fantasy'
+recommended_books = recommend_books(preferred_genre)
+print(recommended_books)
